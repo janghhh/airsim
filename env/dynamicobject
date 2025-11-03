@@ -1,0 +1,607 @@
+# from MARL_test import ParallelEnv
+import gym
+import numpy as np
+import airsim
+import math
+import time
+import random
+
+
+class AirSimMultiDroneEnv:
+    metadata = {"render_modes": []}
+
+    def __init__(
+        self,
+        ip_address="127.0.0.1",
+        follower_names=("Follower0", "Follower1", "Follower2"),
+        step_length=1.0,
+        fixed_z=-10.0,
+        leader_velocity=6.0,
+        optimal_distance=10.0,
+        far_cutoff=60.0,
+        too_close=1.0,
+        dt=0.05,
+        do_visualize=True
+    ):
+        super().__init__()
+        self.possible_agents = list(follower_names)
+        self.agents = self.possible_agents[:]
+
+        self.client = airsim.MultirotorClient(ip=ip_address)
+        self.client.confirmConnection()
+        self.dynamic_name = "DynamicObstacle"
+
+        self.step_length = float(step_length)
+        self.fixed_z = float(fixed_z)
+        self.dt = float(dt)
+        self.do_visualize = bool(do_visualize)
+        self.leader_velocity = float(leader_velocity)
+        self.optimal_distance = float(optimal_distance)
+        self.far_cutoff = float(far_cutoff)
+        self.too_close = float(too_close)
+        self.follower_names = list(follower_names)
+        self._first_setup = True
+
+        self.dist_clip_max = max(self.far_cutoff, self.optimal_distance * 3.0)
+        
+        '''
+        관측값의 개수  
+        '''
+
+        obs_dim = 3 + 36 
+        act_dim = 2
+        share_obs_dim = obs_dim * len(self.possible_agents)
+
+        self.observation_spaces = {
+            agent: gym.spaces.Box(
+                low=np.array([0.0, -200.0, -200.0] + [0.0]*36, dtype=np.float32),
+                high=np.array([self.dist_clip_max, 200.0, 200.0] + [self.far_cutoff]*36, dtype=np.float32),
+                shape=(obs_dim,), dtype=np.float32
+            )
+            for agent in self.possible_agents
+        }
+
+        self.action_spaces = {
+            agent: gym.spaces.Box(low=-1.0, high=1.0, shape=(act_dim,), dtype=np.float32)
+            for agent in self.possible_agents
+        }
+
+        per_agent_low = [0.0, -200.0, -200.0] + [0.0]*36
+        per_agent_high = [self.dist_clip_max, 200.0, 200.0] + [self.far_cutoff]*36
+        self.share_observation_spaces = gym.spaces.Box(
+            low=np.array(per_agent_low * len(self.possible_agents), dtype=np.float32),
+            high=np.array(per_agent_high * len(self.possible_agents), dtype=np.float32),
+            shape=(share_obs_dim,),
+            dtype=np.float32
+        )
+
+        self.current_waypoint_idx = 0
+        self._setup_flight()
+        self._generate_leader_waypoints()
+        self._last_visualize_t = time.time()
+
+    '''
+    라이다 관측 -> 여기를 잘 수정해야한다.
+    초기함수에 lidar_names 에 대한 초기화를 해주어야할 것 같다.
+    '''
+    
+    def _get_lidar_obs(self, agent, lidar_name="LidarSensor1"):
+        lidar_data = self.client.getLidarData(vehicle_name=agent, lidar_name=lidar_name)
+        if len(lidar_data.point_cloud) < 3:
+            return np.full(36, self.far_cutoff, dtype=np.float32)
+
+        pts = np.array(lidar_data.point_cloud, dtype=np.float32).reshape(-1, 3)
+        dists = np.linalg.norm(pts[:, :2], axis=1)
+        angles = np.arctan2(pts[:, 1], pts[:, 0])
+
+        bins = np.linspace(-math.pi, math.pi, 37)
+        min_dists = np.full(36, self.far_cutoff, dtype=np.float32)
+
+        for i in range(36):
+            sel = dists[(angles >= bins[i]) & (angles < bins[i+1])]
+            if len(sel) > 0:
+                min_dists[i] = np.min(sel)
+        return min_dists
+
+    @property
+    def observation_space(self):
+        return [self.observation_spaces[a] for a in self.possible_agents]
+
+    @property
+    def action_space(self):
+        return [self.action_spaces[a] for a in self.possible_agents]
+
+    @property
+    def share_observation_space(self):
+        return [self.share_observation_spaces for _ in self.possible_agents]
+
+    def seed(self, seed):
+        random.seed(seed)
+        np.random.seed(seed)
+
+    # --------------------- 초기화/이륙 ---------------------
+    def _setup_flight(self):
+        if self._first_setup:
+            self.client.reset()
+            # Drone1
+            self.client.enableApiControl(True, "Drone1")
+            self.client.armDisarm(True, "Drone1")
+
+            # Followers
+            for agent in self.possible_agents:
+                self.client.enableApiControl(True, vehicle_name=agent)
+                self.client.armDisarm(True, vehicle_name=agent)
+
+            # <<< DynamicObstacle 추가 >>>
+            self.client.enableApiControl(True, vehicle_name=self.dynamic_name)
+            self.client.armDisarm(True, vehicle_name=self.dynamic_name)
+
+            # 이륙
+            futs = [self.client.takeoffAsync(vehicle_name="Drone1")]
+            futs += [self.client.takeoffAsync(vehicle_name=a) for a in self.possible_agents]
+            futs += [self.client.takeoffAsync(vehicle_name=self.dynamic_name)]   # 추가
+            for f in futs: f.join()
+
+            time.sleep(1.0)
+            self._teleport_to_start()
+            self._first_setup = False
+
+    # --------------------- 유인기 경로 생성 ---------------------
+    def _generate_leader_waypoints(self):
+        leader_start_pos = np.array([5.0, 2.5, self.fixed_z])
+        distance = random.uniform(100.0, 100.0)
+        angle = random.uniform(0, 2 * np.pi)
+        final_destination = leader_start_pos + np.array([
+            distance * np.cos(angle),
+            distance * np.sin(angle),
+            0
+        ])
+        self.leader_waypoints = [final_destination]
+        self.current_waypoint_idx = 0
+
+        try:
+            object_name = "target1v1_5"
+            flag_position = airsim.Vector3r(float(final_destination[0]),
+                                           float(final_destination[1]),
+                                           float(self.fixed_z + 8.0))
+            flag_orientation = airsim.to_quaternion(0, 80.1, 0)
+            flag_pose = airsim.Pose(flag_position, flag_orientation)
+            self.client.simSetObjectPose(object_name, flag_pose)
+        except Exception as e:
+            print(f"'{object_name}' 객체를 이동 실패. 언리얼 레벨에 해당 이름의 객체가 있는지 확인.")
+            print(e)
+
+    # --------------------- 유인기 이동 ---------------------
+    def _update_leader_movement(self):
+        if not self.leader_waypoints:
+            self._generate_leader_waypoints()
+        target = self.leader_waypoints[0]
+        pose = self.client.simGetVehiclePose(vehicle_name="Drone1")
+        cur = np.array([pose.position.x_val, pose.position.y_val, pose.position.z_val])
+        dist_to_target = np.linalg.norm(target[:2] - cur[:2])
+        if dist_to_target < 3.0:
+            return True
+
+        dir_vec = target - cur
+        dist = np.linalg.norm(dir_vec[:2])
+        if dist > 1e-6:
+            dir_unit = dir_vec / (dist + 1e-9)
+            move = dir_unit * self.leader_velocity * self.dt
+            new_pos = cur + move
+            self.client.simSetVehiclePose(
+                airsim.Pose(airsim.Vector3r(new_pos[0], new_pos[1], self.fixed_z),
+                            airsim.Quaternionr()),
+                ignore_collision=True,
+                vehicle_name="Drone1"
+            )
+
+        if self.do_visualize:
+            now = time.time()
+            if (now - self._last_visualize_t) >= 0.1:
+                self.client.simFlushPersistentMarkers()
+                self._visualize_circles()
+                self._last_visualize_t = now
+
+        return False
+
+    # --------------------- 시각화 ---------------------
+    def _visualize_circles(self):
+        try:
+            leader_pos = self.client.simGetObjectPose("Drone1").position
+            center = np.array([leader_pos.x_val, leader_pos.y_val, leader_pos.z_val], dtype=float)
+
+            def ring_points(radius, n=36):
+                pts = []
+                for i in range(n+1):
+                    ang = (i / n) * 2 * np.pi
+                    x = center[0] + radius * np.cos(ang)
+                    y = center[1] + radius * np.sin(ang)
+                    z = center[2]
+                    pts.append(airsim.Vector3r(x, y, z))
+                return pts
+
+            line_thickness = 20.0
+            self.client.simPlotLineStrip(ring_points(self.optimal_distance), [1, 1, 0, 0.8], line_thickness, 0.15, True)
+            self.client.simPlotLineStrip(ring_points(self.far_cutoff), [0, 1, 0, 0.8], line_thickness, 0.15, True)
+        except Exception:
+            pass
+
+    # --------------------- 관측 ---------------------
+    def _get_obs(self, agent):
+        leader_pos = self.client.simGetObjectPose("Drone1").position
+        agent_pos = self.client.simGetObjectPose(agent).position
+        rel = np.array([leader_pos.x_val - agent_pos.x_val,
+                        leader_pos.y_val - agent_pos.y_val], dtype=np.float32)
+        dist = float(np.linalg.norm(rel))
+        clipped_dist = float(np.clip(dist, 0.0, self.dist_clip_max))
+        base_obs = np.array([clipped_dist, rel[0], rel[1]], dtype=np.float32)
+
+        if agent.startswith("Follower"):
+            lidar_obs = self._get_lidar_obs(agent)
+            obs = np.concatenate([base_obs, lidar_obs], axis=0).astype(np.float32)
+        else:
+            obs = base_obs
+        return obs
+
+    # --------------------- 에이전트 이동 ---------------------
+    def _do_action(self, agent, action):
+        a = np.clip(np.asarray(action, dtype=np.float32), -1.0, 1.0)
+        pose = self.client.simGetVehiclePose(agent)
+        x, y, z = pose.position.x_val, pose.position.y_val, self.fixed_z
+        dx = float(a[0]) * float(self.step_length)
+        dy = float(a[1]) * float(self.step_length)
+        nx = float(x) + dx
+        ny = float(y) + dy
+        nz = float(z)
+        new_pos = airsim.Vector3r(nx, ny, nz)
+        new_pose = airsim.Pose(new_pos, airsim.Quaternionr(0.0, 0.0, 0.0, 1.0))
+        self.client.simSetVehiclePose(new_pose, False, vehicle_name=agent)
+
+    # --------------------- 보상 ---------------------
+    def _compute_reward(self, agent, obs=None):
+        rewards_dict = {}
+        agent_pos = self.client.simGetObjectPose(agent).position
+
+        # 💥 1️⃣ 드론 간 충돌 패널티 (기존)
+        for other in self.agents:
+            if other == agent:
+                continue
+            other_pos = self.client.simGetObjectPose(other).position
+            dist_agents = np.linalg.norm([
+                agent_pos.x_val - other_pos.x_val,
+                agent_pos.y_val - other_pos.y_val
+            ])
+            if dist_agents < 0.5:
+                rewards_dict['penalty_agent_collision'] = -1000.0
+                return rewards_dict, True
+
+        # 📡 2️⃣ 라이다 근접 경고 (기존)
+        lidar_obs = self._get_lidar_obs(agent)
+        min_dist = np.min(lidar_obs)
+        if min_dist < 1.0:
+            rewards_dict['penalty_lidar_near'] = -500.0
+            return rewards_dict, False
+
+        # 👁 3️⃣ 기본 거리 계산
+        if obs is None:
+            obs = self._get_obs(agent)
+        dist_raw = math.hypot(float(obs[1]), float(obs[2]))
+
+        if dist_raw < self.too_close:
+            rewards_dict['penalty_too_close'] = -1000.0
+            return rewards_dict, True
+
+        if dist_raw > self.far_cutoff:
+            rewards_dict['penalty_too_far'] = -1000.0
+            return rewards_dict, True
+
+        # 🧠 4️⃣ 보호 행동용 보상 항목 추가 -------------------------
+        leader_pos = self.client.simGetObjectPose("Drone1").position
+        obstacle_pos = self.client.simGetObjectPose(self.dynamic_name).position
+
+        # 거리 계산
+        dist_leader_obstacle = math.hypot(
+            leader_pos.x_val - obstacle_pos.x_val,
+            leader_pos.y_val - obstacle_pos.y_val
+        )
+        dist_agent_obstacle = math.hypot(
+            agent_pos.x_val - obstacle_pos.x_val,
+            agent_pos.y_val - obstacle_pos.y_val
+        )
+
+        # --- 보호 관련 보상 로직 ---
+        shield_reward = 0.0
+
+        # (1) 장애물이 유인기 근처로 접근하면 → 위험 (보호 실패 경향)
+        if dist_leader_obstacle < 5.0:
+            shield_reward -= 500.0
+
+        # (2) 반대로, 팔로워가 장애물에 근접해 방어하면 → 방패 성공
+        if dist_agent_obstacle < 3.0 and dist_leader_obstacle < 6.0:
+            shield_reward += 1000.0  # 대신 막았다고 간주
+
+        # (3) 장애물과 유인기 사이를 가로막는 위치에 있으면 → 추가 보상
+        vec_leader_obst = np.array([
+            obstacle_pos.x_val - leader_pos.x_val,
+            obstacle_pos.y_val - leader_pos.y_val
+        ])
+        vec_leader_agent = np.array([
+            agent_pos.x_val - leader_pos.x_val,
+            agent_pos.y_val - leader_pos.y_val
+        ])
+        dot = np.dot(vec_leader_obst, vec_leader_agent)
+        if dot > 0:  # 같은 방향에 있을 때 (즉, 방어선 상에 위치)
+            shield_reward += 300.0
+
+        rewards_dict["shield_reward"] = shield_reward
+
+        # 🎯 5️⃣ 기본 거리 유지 보상 (기존)
+        sigma = 5.0
+        if dist_raw <= self.optimal_distance:
+            gauss_val = math.exp(-((dist_raw - self.optimal_distance) ** 2) / (2 * sigma**2))
+            gauss_at_0 = math.exp(-(self.optimal_distance**2) / (2 * sigma**2))
+            reward_val = 10.0 * (gauss_val - gauss_at_0) / (1 - gauss_at_0 + 1e-9)
+        else:
+            t = (dist_raw - self.optimal_distance) / (self.far_cutoff - self.optimal_distance + 1e-9)
+            alpha = 6.0
+            reward_val = 10.0 + (-1010.0) * ((math.exp(alpha * t) - 1.0) / (math.exp(alpha) - 1.0))
+
+        rewards_dict['distance_reward'] = reward_val
+
+        # 전체 보상 합산
+        total_reward = shield_reward + reward_val
+        rewards_dict["total_reward"] = total_reward
+
+        return rewards_dict, False
+
+
+
+    # --------------------- 팀 보상 집계 ---------------------
+    def _team_reward_and_done(self, per_agent_results, mission_accomplished=False):
+        any_fail = any(done_i for (_, done_i) in per_agent_results)
+        if any_fail:
+            return -200.0, True, {"final_status": "FAIL_CRASH"}
+
+        if mission_accomplished:
+            tracking_rewards = [r_i for (r_i, _) in per_agent_results]
+            final_reward = np.mean(tracking_rewards) + 500.0
+            return final_reward, True, {"final_status": "SUCCESS"}
+
+        tracking_rewards = [r_i for (r_i, _) in per_agent_results]
+        return np.mean(tracking_rewards), False, {}
+    
+
+
+        # --------------------- 초기 위치 설정 ---------------------
+    def _teleport_to_start(self):
+        start_cfg = {
+            "Drone1":    (5.0,  2.5, float(self.fixed_z)),
+            "Follower0": (0.0,  0.0, float(self.fixed_z)),
+            "Follower1": (0.0,  2.5, float(self.fixed_z)),
+            "Follower2": (0.0,  5.0, float(self.fixed_z)),
+            # ★ 추가: 동적 장애물 시작 위치 (유인기 근처)
+            self.dynamic_name: (5.0 + 10  , 2.5 + 10, float(self.fixed_z)),
+        }
+
+        # API 제어 활성화
+        self.client.enableApiControl(True, vehicle_name="Drone1")
+        for agent in self.possible_agents:
+            self.client.enableApiControl(True, vehicle_name=agent)
+        self.client.enableApiControl(True, vehicle_name=self.dynamic_name)
+
+        # 각 드론 위치 설정
+        for name, (x, y, z) in start_cfg.items():
+            self.client.simSetVehiclePose(
+                airsim.Pose(airsim.Vector3r(float(x), float(y), float(z)),
+                            airsim.Quaternionr(0.0, 0.0, 0.0, 1.0)),
+                ignore_collision=True,
+                vehicle_name=name
+            )
+        time.sleep(0.05)
+
+
+    # --------------------- 동적장애물 FSM + 직선/곡선 추격 ---------------------
+    def _update_dynamic_obstacle(self, t):
+        name = self.dynamic_name
+        fixed_z = self.fixed_z
+        attack_speed = 6.0
+        STOP_DISTANCE = 1.0
+
+        # 상태 변수 초기화
+        if not hasattr(self, "_obstacle_state"):
+            self._obstacle_state = "IDLE"
+            self._next_chase_time = time.time() + random.uniform(1.0, 3.0)
+            self._idle_pos = None
+            self._chase_mode = None  # 'STRAIGHT' or 'CURVED'
+
+        leader_pose = self.client.simGetObjectPose("Drone1").position
+        obstacle_pose = self.client.simGetObjectPose(name).position
+        lx, ly, lz = leader_pose.x_val, leader_pose.y_val, leader_pose.z_val
+        cx, cy, cz = obstacle_pose.x_val, obstacle_pose.y_val, obstacle_pose.z_val
+
+        dx, dy = lx - cx, ly - cy
+        dist_2d = math.sqrt(dx**2 + dy**2) + 1e-9
+
+        # ------------------ IDLE 모드 ------------------
+        if self._obstacle_state == "IDLE":
+            if self._idle_pos is None:
+                radius = random.uniform(30.0, 50.0)
+                angle = random.uniform(0, 2 * np.pi)
+                self._idle_pos = (lx + radius * np.cos(angle), ly + radius * np.sin(angle))
+                print(f"[🟢 대기모드] {radius:.1f}m 거리에서 대기")
+
+            ix, iy = self._idle_pos
+            dx_i, dy_i = ix - cx, iy - cy
+            dist_idle = math.sqrt(dx_i**2 + dy_i**2)
+            if dist_idle > 1.0:
+                vx = dx_i / dist_idle * 2.0
+                vy = dy_i / dist_idle * 2.0
+                vz = (fixed_z - cz) * 0.3
+                self.client.moveByVelocityAsync(vx, vy, vz, duration=0.1, vehicle_name=name) # duration=0.2
+            else:
+                self.client.moveByVelocityAsync(0, 0, 0, duration=0.1, vehicle_name=name)
+
+            # 일정 시간 후 추격 시작
+            if time.time() > self._next_chase_time:
+                self._obstacle_state = "CHASE"
+                self._chase_start = time.time()
+                self._chase_mode = random.choice(["STRAIGHT", "CURVED"])
+                print(f"[🚀 추격 시작] 모드: {self._chase_mode}")
+                return
+
+        # ------------------ CHASE 모드 ------------------
+        elif self._obstacle_state == "CHASE":
+            elapsed = time.time() - self._chase_start
+            chase_duration = random.uniform(10.0, 11.0)
+
+            if elapsed > chase_duration:
+                print(f"[⚪ 추격 종료] ({self._chase_mode}) {elapsed:.1f}s 후 대기 복귀")
+                self._obstacle_state = "RETURN"
+                self._idle_pos = None
+                self._next_chase_time = time.time() + random.uniform(1.0, 3.0)
+                return
+
+            if dist_2d <= STOP_DISTANCE:
+                # print(f"[✅ 정지] Drone1과 거의 일치 (거리={dist_2d:.2f}m)")
+                self.client.moveByVelocityAsync(0, 0, 0, duration=0.1, vehicle_name=name)
+                return
+
+            dir_x = dx / dist_2d
+            dir_y = dy / dist_2d
+            vz = np.clip((fixed_z - cz) * 3.0, -2.0, 2.0)
+
+            # --- (1) 직선 추격 ---
+            if self._chase_mode == "STRAIGHT":
+                vx = dir_x * attack_speed
+                vy = dir_y * attack_speed
+
+            # --- (2) 곡선 추격 ---
+            else:
+                amplitude = 10.0
+                freq = 1.0
+                phase = math.sin(2.0 * math.pi * freq * t/2)
+                perp_x = -dir_y
+                perp_y = dir_x
+                vx = (dir_x * attack_speed) + (perp_x * amplitude * phase)
+                vy = (dir_y * attack_speed) + (perp_y * amplitude * phase)
+
+                self.client.moveByVelocityZAsync(float(vx), float(vy), float(self.fixed_z), 0.1,vehicle_name=name)
+
+
+            self.client.moveByVelocityAsync(vx, vy, vz, duration=0.1, vehicle_name=name)
+
+        # ------------------ RETURN 모드 ------------------
+        elif self._obstacle_state == "RETURN":
+            if self._idle_pos is None:
+                radius = random.uniform(30.0, 50.0)
+                angle = random.uniform(0, 2 * np.pi)
+                self._idle_pos = (lx + radius * np.cos(angle), ly + radius * np.sin(angle))
+                print(f"[🔄 대기 위치 재설정] 새 지점으로 복귀 중")
+
+            ix, iy = self._idle_pos
+            dx_r, dy_r = ix - cx, iy - cy
+            dist_return = math.sqrt(dx_r**2 + dy_r**2)
+            if dist_return > 1.0:
+                vx = dx_r / dist_return * 3.0
+                vy = dy_r / dist_return * 3.0
+                vz = (fixed_z - cz) * 0.3
+                self.client.moveByVelocityAsync(vx, vy, vz, duration=0.1, vehicle_name=name)
+            else:
+                self._obstacle_state = "IDLE"
+                self._next_chase_time = time.time() + random.uniform(1.0, 3.0)
+                print("[🟢 대기모드 복귀 완료]")
+
+
+
+
+
+
+
+
+    # --------------------- PettingZoo API ---------------------
+    def reset(self, seed=None, options=None):
+        self.agents = self.possible_agents[:]
+        self._setup_flight()
+        self._generate_leader_waypoints()
+        self.current_waypoint_idx = 0
+        self._teleport_to_start()
+        self.client.simFlushPersistentMarkers()
+         # 🔧 동적장애물 상태 초기화 (중요)
+        self._obstacle_state = "IDLE"
+        self._idle_pos = None
+        self._next_chase_time = time.time() + random.uniform(1.0, 3.0)
+        self._chase_mode = None
+        print("[♻️ Reset] 동적장애물 상태 초기화 완료")
+
+        return [self._get_obs(a) for a in self.agents]
+
+    def step(self, actions):
+        t = time.time()  # 현재 시간 (또는 self.step_count 등)
+        self._update_dynamic_obstacle(t)  # 장애물 갱신
+
+        for agent, act in zip(self.agents, actions):
+            self._do_action(agent, act)
+        mission_accomplished = self._update_leader_movement()
+
+         # --------------------- 💥 유인기-동적장애물 충돌 감지 ---------------------
+        leader_pos = self.client.simGetObjectPose("Drone1").position
+        obstacle_pos = self.client.simGetObjectPose(self.dynamic_name).position
+
+        dx = leader_pos.x_val - obstacle_pos.x_val
+        dy = leader_pos.y_val - obstacle_pos.y_val
+        dist_leader_obstacle = math.sqrt(dx**2 + dy**2)
+
+        if dist_leader_obstacle <= 0.5:  # 충돌 임계값 (m)
+            print(f"[💥 충돌 감지] Drone1 ↔ {self.dynamic_name} 거리 = {dist_leader_obstacle:.2f}m → 에피소드 종료")
+
+            # 모든 에이전트가 동일한 페널티와 종료 상태를 받음
+            obs_list = [self._get_obs(a) for a in self.agents]
+            rewards_list = [-1000.0] * len(self.agents)
+            dones_list = [True] * len(self.agents)
+            infos_list = [
+                {"collision": "leader_obstacle", "final_status": "FAIL_COLLISION"}
+                for _ in self.agents
+            ]
+
+            return obs_list, rewards_list, dones_list, infos_list
+        
+        # # --------------------- ⭐️ 추가: 에이전트-유인기 거리 출력 ⭐️ ---------------------
+        # print("[팔로워-유인기 거리]")
+        # for agent in self.agents:
+        #     # _get_obs 함수를 사용하여 거리(dist) 정보를 가져옵니다.
+        #     # obs[0]은 clipped_dist, obs[1]은 rel_x, obs[2]는 rel_y 입니다.
+        #     o = self._get_obs(agent)
+            
+        #     # obs[1]과 obs[2]를 사용하여 순수한 X-Y 평면 거리(dist_raw)를 계산합니다.
+        #     rel_x = float(o[1])
+        #     rel_y = float(o[2])
+        #     dist_raw = math.hypot(rel_x, rel_y)
+            
+        #     print(f"  > {agent}: {dist_raw:.2f}m")
+        # # ---------------------------------------------------------------------
+
+        obs_list = []
+        per_agent_results = []
+        per_agent_detailed_infos = []
+
+        for agent in self.agents:
+            o = self._get_obs(agent)
+            rewards_dict, done_i = self._compute_reward(agent, obs=o)
+            total_reward = sum(rewards_dict.values())
+            obs_list.append(o)
+            per_agent_results.append((total_reward, done_i))
+            per_agent_detailed_infos.append({"rewards": rewards_dict})
+
+        team_reward, done_all, final_team_info = self._team_reward_and_done(per_agent_results, mission_accomplished)
+
+        n = len(self.agents)
+        rewards_list = [team_reward] * n
+        dones_list = [done_all] * n
+        infos_list = []
+
+        for i in range(n):
+            agent_info = per_agent_detailed_infos[i].copy()
+            agent_info.update(final_team_info)
+            infos_list.append(agent_info)
+
+        return obs_list, rewards_list, dones_list, infos_list
